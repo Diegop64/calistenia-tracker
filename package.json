@@ -1,0 +1,14 @@
+{
+  "name": "calisthenics-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PWA para registrar y analizar entrenamientos de calistenia (iOS).",
+  "scripts": {
+    "build:css": "tailwindcss -c tailwind.config.js -i src/input.css -o css/app.css --minify",
+    "watch:css": "tailwindcss -c tailwind.config.js -i src/input.css -o css/app.css --watch",
+    "serve": "npx --yes serve . -l 8080"
+  },
+  "devDependencies": {
+    "tailwindcss": "^3.4.19"
+  }
+}
