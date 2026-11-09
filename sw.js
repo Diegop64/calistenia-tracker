@@ -3,7 +3,7 @@
  * IMPORTANTE: al cambiar CUALQUIER archivo de la lista, sube VERSION (v1 -> v2...)
  * para que los móviles descarguen la versión nueva. Los datos (IndexedDB) NO se tocan.
  */
-const VERSION = 'v8';
+const VERSION = 'v14';
 const CACHE = `calistenia-${VERSION}`;
 
 const SHELL = [
@@ -20,6 +20,7 @@ const SHELL = [
   'js/sync.js',
   'js/syncCore.js',
   'js/resumen.js',
+  'js/zonas.js',
   'js/firebase-config.js',
   'vendor/firebase.js',
   'icons/icon-192.png',

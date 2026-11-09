@@ -2,7 +2,7 @@
 //
 // Modelo relacional (4 tablas + meta):
 //   objetivos       { id, nombre }
-//   ejercicios      { id, nombre, tipo: 'reps' | 'tiempo' | 'complejo', objetivo_id | null }
+//   ejercicios      { id, nombre, tipo: 'reps' | 'tiempo' | 'complejo', objetivo_id | null, zona?, factor?, asistido?, clave? }   (zona: zonas.js · factor/asistido: stats.js cargaDe)
 //   entrenamientos  { id, fecha: 'YYYY-MM-DD', notas }
 //   series          { id, entrenamiento_id, ejercicio_id, set_numero, valor, peso_extra, segundos? }   (segundos: solo 'complejo')
 //   meta            { key, value }   (última copia de seguridad, etc.)

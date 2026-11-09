@@ -198,3 +198,12 @@ El botón ✦ de **Historial** (y «Resumen para tu IA» en Datos y copias) gene
 molestias, notas, tendencias y objetivos (4 semanas, 12 semanas o todo), con instrucciones opcionales para que la IA analice y proponga ajustes.
 Se copia al portapapeles (o se comparte) y se pega en ChatGPT, Claude, etc. Se genera en el dispositivo: nada sale hasta que tú lo pegas.
 El código está en `js/resumen.js` (función pura `generarResumen`).
+
+## Zonas, objetivos, carga y fuerza estimada (v12)
+
+- **Zonas** (`js/zonas.js`): cada ejercicio cuenta en una zona principal (Hombro, Pecho y tríceps, Espalda, Bíceps y brazos, Core, Pierna). Progreso → Zonas muestra series, entrenos y comparación con el periodo anterior; la pestaña Ejercicios agrupa el catálogo por zona.
+- **Objetivos = solo habilidades** (Press a pino, Front/Back lever, Planche, Muscle-up, Bandera). Los grupos genéricos de la biblioteca (Espalda, Pecho y empuje, Core, Pierna) ya no crean objetivo; los creados por versiones anteriores se retiran solos al abrir la app.
+- **Carga por ejercicio** (`cargaDe` en `js/stats.js`): parte del peso corporal que mueves (todo / parte / solo los kg) y si va con banda (los kg restan).
+- **Peso corporal**: se anota en «Cómo ha ido» (cada 1-2 semanas basta). Con él, la **fuerza estimada** = carga × (1 + reps/30) mide el progreso cuando hay lastre, banda o kg externos, así que subir lastre y bajar reps no cuenta como bajada.
+- **Tendencia**: mejor marca de las últimas 3 sesiones frente a las 3 anteriores; con menos de 4 sesiones no opina. El índice de objetivo usa media geométrica y solo ejercicios entrenados en las últimas 6 semanas.
+- **Registro**: al añadir un ejercicio se crean tantas series como la última vez (reps vacías con la marca anterior en gris; ✓ la repite); ★ marca un récord; el crono no sobrescribe series hechas y descarta toques de menos de 3 s; al volver a la app tras unas horas se abre en hoy.
