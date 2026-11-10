@@ -38,8 +38,14 @@ const byNombre = (a, b) => a.nombre.localeCompare(b.nombre, 'es', { sensitivity:
 const ejById = (id) => state.ejercicios.find((e) => e.id === id);
 const objById = (id) => state.objetivos.find((o) => o.id === id);
 const entDe = (fecha) => state.entrenamientos.find((e) => e.fecha === fecha);
-const seriesDe = (entId, ejId) =>
-  state.series.filter((s) => s.entrenamiento_id === entId && s.ejercicio_id === ejId).sort((a, b) => a.set_numero - b.set_numero);
+// Un ejercicio puede repetirse en el mismo entreno (p. ej. dominadas lastradas, otro ejercicio y luego dominadas normales).
+// Cada aparición es una «tanda»: la n-ésima vez que el id sale en ent.ejercicios es la tanda n-1; las series de la tanda 0
+// NO llevan campo `bloque` (así los datos anteriores a esta función siguen siendo válidos), las demás llevan bloque: n.
+const tandaDe = (s) => s.bloque || 0;
+const seriesDe = (entId, ejId, b = 0) =>
+  state.series.filter((s) => s.entrenamiento_id === entId && s.ejercicio_id === ejId && tandaDe(s) === b).sort((a, b2) => a.set_numero - b2.set_numero);
+const veces = (ent, ejId) => ent.ejercicios.filter((id) => id === ejId).length;
+const clavePleg = (ejId, b) => `${ejId}:${b}`;
 const tieneSeries = (ejId) => state.series.some((s) => s.ejercicio_id === ejId);
 const esInstalada = () => navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
 const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
@@ -82,34 +88,44 @@ async function asegurarEntreno(fecha) {
 
 async function addEjAlEntreno(ejId) {
   const ent = await asegurarEntreno(ui.fecha);
-  if (ent.ejercicios.includes(ejId)) return;
+  const b = veces(ent, ejId);   // 0 la primera vez; 1, 2… si lo repites en el mismo entreno
+  delete ent.concluido;
   ent.ejercicios.push(ejId);
   // Tantas series como la última vez. Las reps quedan vacías (la marca anterior se ve en gris y ✓ la repite);
   // el lastre y el aguante sí se copian: son la carga con la que vas a trabajar y se ven y se pueden cambiar.
+  // Una tanda repetida empieza con 1 serie y sin carga copiada: normalmente la haces distinta (con lastre y sin él).
   const prev = sesionPrevia(state, ejId, ui.fecha);
-  const n = Math.max(1, prev ? prev.sets.length : 1);
+  const n = b > 0 ? 1 : Math.max(1, prev ? prev.sets.length : 1);
   const nuevas = Array.from({ length: n }, (_, i) => {
-    const p = prev?.sets[i];
+    const p = b > 0 ? null : prev?.sets[i];
     const s = { id: uid(), entrenamiento_id: ent.id, ejercicio_id: ejId, set_numero: i + 1, valor: null, peso_extra: p?.peso_extra || null, hecha: false };
+    if (b > 0) s.bloque = b;
     if (ejById(ejId)?.tipo === 'complejo') s.segundos = p?.segundos || null;
     return s;
   });
   state.series.push(...nuevas);
   await DB.put('entrenamientos', ent);
   await DB.putMany('series', nuevas);
+  return b;
 }
 
 /** Marca de referencia de una serie: la misma serie la última vez; si no, la serie anterior de hoy; si no, la última de la vez anterior. */
-function marcaRef(entId, ejId, idx) {
+function setsPrevios(prev, b) {
+  if (!prev) return [];
+  const propios = b > 0 ? prev.sets.filter((s) => tandaDe(s) === b) : prev.sets;
+  return propios.length ? propios : prev.sets;
+}
+function marcaRef(entId, ejId, idx, b = 0) {
   const prev = sesionPrevia(state, ejId, ui.fecha);
-  const hoySets = seriesDe(entId, ejId);
+  const ps = setsPrevios(prev, b);
+  const hoySets = seriesDe(entId, ejId, b);
   const antHoy = idx > 0 && hoySets[idx - 1] && hoySets[idx - 1].valor > 0 ? hoySets[idx - 1] : null;
-  return prev?.sets[idx] || antHoy || (prev ? prev.sets[prev.sets.length - 1] : null);
+  return ps[idx] || antHoy || (ps.length ? ps[ps.length - 1] : null);
 }
 
-async function addSerie(ejId) {
+async function addSerie(ejId, b = 0) {
   const ent = entDe(ui.fecha); if (!ent) return;
-  const prev = seriesDe(ent.id, ejId);
+  const prev = seriesDe(ent.id, ejId, b);
   const last = prev[prev.length - 1];
   const s = {
     id: uid(), entrenamiento_id: ent.id, ejercicio_id: ejId,
@@ -118,6 +134,7 @@ async function addSerie(ejId) {
     peso_extra: last ? last.peso_extra : null, // el lastre sí: es la carga con la que sigues
     hecha: false,
   };
+  if (b > 0) s.bloque = b;
   if (ejById(ejId)?.tipo === 'complejo') s.segundos = last ? (last.segundos ?? null) : null;   // el aguante se repite como las reps
   state.series.push(s);
   await DB.put('series', s);
@@ -127,7 +144,7 @@ async function delSerie(id) {
   const s = state.series.find((x) => x.id === id); if (!s) return;
   flush();
   state.series = state.series.filter((x) => x.id !== id);
-  const resto = seriesDe(s.entrenamiento_id, s.ejercicio_id);
+  const resto = seriesDe(s.entrenamiento_id, s.ejercicio_id, tandaDe(s));
   resto.forEach((x, i) => { x.set_numero = i + 1; });
   await DB.deleteWhere({ series: [id] });
   await DB.putMany('series', resto);
@@ -145,13 +162,19 @@ async function limpiarEntrenoVacio(ent) {
   }
 }
 
-async function quitarEjDelEntreno(ejId) {
+async function quitarEjDelEntreno(ejId, b = 0) {
   const ent = entDe(ui.fecha); if (!ent) return;
   flush();
-  const ids = state.series.filter((s) => s.entrenamiento_id === ent.id && s.ejercicio_id === ejId).map((s) => s.id);
+  const ids = state.series.filter((s) => s.entrenamiento_id === ent.id && s.ejercicio_id === ejId && tandaDe(s) === b).map((s) => s.id);
   state.series = state.series.filter((s) => !ids.includes(s.id));
-  ent.ejercicios = ent.ejercicios.filter((id) => id !== ejId);
+  // quita solo la aparición b-ésima y las tandas posteriores del mismo ejercicio suben un puesto
+  let k = -1;
+  const i = ent.ejercicios.findIndex((id) => id === ejId && ++k === b);
+  if (i >= 0) ent.ejercicios.splice(i, 1);
+  const bajan = state.series.filter((s) => s.entrenamiento_id === ent.id && s.ejercicio_id === ejId && tandaDe(s) > b);
+  bajan.forEach((s) => { if (tandaDe(s) - 1 > 0) s.bloque = tandaDe(s) - 1; else delete s.bloque; });
   await DB.deleteWhere({ series: ids });
+  if (bajan.length) await DB.putMany('series', bajan);
   await limpiarEntrenoVacio(ent);
 }
 
@@ -206,6 +229,13 @@ async function normalizar() {
     else {
       const faltan = desdeSeries.filter((id) => !ent.ejercicios.includes(id));
       if (faltan.length) { ent.ejercicios.push(...faltan); cambiados.push(ent); }
+    }
+    // series de una tanda repetida cuya aparición falta en la lista (p. ej. tras unir datos de dos dispositivos)
+    const maxT = new Map();
+    for (const s of state.series) if (s.entrenamiento_id === ent.id && tandaDe(s) > 0) maxT.set(s.ejercicio_id, Math.max(maxT.get(s.ejercicio_id) || 0, tandaDe(s)));
+    for (const [id, m] of maxT) {
+      let falta = m + 1 - veces(ent, id);
+      while (falta-- > 0) { ent.ejercicios.push(id); if (!cambiados.includes(ent)) cambiados.push(ent); }
     }
     if (typeof ent.notas !== 'string') { ent.notas = ''; if (!cambiados.includes(ent)) cambiados.push(ent); }
   }
@@ -309,18 +339,35 @@ function toast(msg, accion = null) {
 /* ---------- Hojas modales (bottom sheets) ---------- */
 let sheetOnClose = null;
 let sheetCtx = null;
-function abrirSheet(html, { onClose = null, ctx = null } = {}) {
+function abrirSheet(html, { onClose = null, ctx = null, clase = '' } = {}) {
   sheetOnClose = onClose; sheetCtx = ctx;
   sheetRoot.innerHTML = `<div class="sheet-backdrop" data-action="close-sheet"></div>
-    <div class="sheet" role="dialog" aria-modal="true"><div class="sheet-grip"></div>${html}</div>`;
+    <div class="sheet ${clase}" role="dialog" aria-modal="true"><div class="sheet-grip"></div>${html}</div>`;
+  ajustarTeclado();
   document.body.classList.add('sheet-open');
   if (punteroFino()) sheetRoot.querySelector('[data-field="buscar"], input[name="nombre"], input[name="email"]')?.focus();
+}
+/**
+ * Teclado en el móvil: el teclado reduce el viewport visual pero la hoja (position: fixed) sigue anclada al layout,
+ * así que quedaba debajo del teclado. Medimos cuánto tapa (--kb) y la altura visible (--vvh) y la hoja se levanta y se encoge.
+ */
+function ajustarTeclado() {
+  const vv = window.visualViewport; if (!vv) return;
+  const kb = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop));
+  const r = document.documentElement.style;
+  r.setProperty('--kb', kb + 'px');
+  r.setProperty('--vvh', Math.round(vv.height) + 'px');
+  document.body.classList.toggle('kb-open', kb > 80);
+}
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', ajustarTeclado);
+  window.visualViewport.addEventListener('scroll', ajustarTeclado);
 }
 function cerrarSheet({ silencioso = false } = {}) {
   const cb = sheetOnClose;
   sheetOnClose = null; sheetCtx = null;
   sheetRoot.innerHTML = '';
-  document.body.classList.remove('sheet-open');
+  document.body.classList.remove('sheet-open', 'kb-open');
   if (cb && !silencioso) cb();
 }
 let confirmRes = null;
@@ -349,8 +396,9 @@ function render({ top = false } = {}) {
   else if (ui.view === 'library') html = renderCatalogo();
   else html = renderStats();
   viewEl.innerHTML = html;
-  viewEl.classList.toggle('has-fab', ui.view === 'train');
-  fabEl.classList.toggle('hidden', ui.view !== 'train');
+  const conFab = ui.view === 'train' && !entDe(ui.fecha)?.concluido;   // concluido: sin botones de edición
+  viewEl.classList.toggle('has-fab', conFab);
+  fabEl.classList.toggle('hidden', !conFab);
   document.querySelectorAll('.nav-btn').forEach((b) => {
     if (b.dataset.nav === ui.view) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
   });
@@ -401,7 +449,8 @@ function avisos() {
 function resumenTxt(ent) {
   if (!ent) return '';
   const val = state.series.filter((s) => s.entrenamiento_id === ent.id && serieHecha(s)).length;
-  return `${ent.ejercicios.length} ejercicio${ent.ejercicios.length === 1 ? '' : 's'} · ${val} serie${val === 1 ? '' : 's'} ${val === 1 ? 'hecha' : 'hechas'}`;
+  const nEj = new Set(ent.ejercicios).size;
+  return `${nEj} ejercicio${nEj === 1 ? '' : 's'} · ${val} serie${val === 1 ? '' : 's'} ${val === 1 ? 'hecha' : 'hechas'}`;
 }
 function refreshResumen() {
   const el = $('#resumen'); if (el) el.textContent = resumenTxt(entDe(ui.fecha));
@@ -417,12 +466,25 @@ function renderTrain() {
   const titulo = `<label class="relative block">${esc(fechaEtiqueta(ui.fecha))}
       <input type="date" value="${ui.fecha}" data-field="fecha" class="absolute inset-0 opacity-0 w-full h-full" aria-label="Elegir fecha"></label>`;
 
-  const anadir = `<button data-action="picker" class="btn-primary pc-only !h-11 !px-4">＋ Añadir ejercicio</button>`;
+  const concl = !!(ent && ent.concluido);
+  const anadir = concl ? '' : `<button data-action="picker" class="btn-primary pc-only !h-11 !px-4">＋ Añadir ejercicio</button>`;
   let cards, resumen = '', notas = '';
   if (ent && ent.ejercicios.length) {
-    resumen = `<p id="resumen" class="train-resumen text-sm text-mute mb-3">${resumenTxt(ent)}</p>`;
-    cards = `<div class="train-cards">${ent.ejercicios.map((id) => cardEjercicio(ent, id)).join('')}</div>`;
-    notas = checkinHTML(ent);
+    // Al abrir un día, las tarjetas con todas sus series hechas empiezan plegadas; las nuevas o a medias, abiertas.
+    if (ui.plegFecha !== ui.fecha) {
+      ui.plegFecha = ui.fecha;
+      ui.plegados = new Set();
+      ent.ejercicios.forEach((id, i) => {
+        const b = ent.ejercicios.slice(0, i).filter((x) => x === id).length;
+        const ss = seriesDe(ent.id, id, b);
+        if (ss.length && ss.every(serieHecha)) ui.plegados.add(clavePleg(id, b));
+      });
+    }
+    resumen = concl
+      ? `<div class="train-resumen note border-accent/40 mb-3 flex items-center justify-between gap-3"><p class="text-sm min-w-0"><b class="text-accent">✓ Entreno concluido</b><span id="resumen" class="block text-mute">${resumenTxt(ent)}</span></p><button data-action="reabrir" class="btn-mini shrink-0">Editar entreno</button></div>`
+      : `<p id="resumen" class="train-resumen text-sm text-mute mb-3">${resumenTxt(ent)}</p>`;
+    cards = `<div class="train-cards">${ent.ejercicios.map((id, i) => cardEjercicio(ent, id, i)).join('')}</div>`;
+    notas = concl ? `<div class="train-notas">${bloqueCheckin(ent)}</div>` : checkinHTML(ent) + `<button data-action="concluir" class="train-concluir btn-primary w-full mt-4">Concluir entreno</button>`;
   } else {
     cards = `<div class="card text-center py-10 mt-2">
       <p class="font-semibold text-lg">Sin ejercicios todavía</p>
@@ -459,19 +521,37 @@ function checkinHTML(ent) {
   </section>`;
 }
 
-function cardEjercicio(ent, ejId) {
+function cardEjercicio(ent, ejId, idx = ent.ejercicios.indexOf(ejId)) {
   const ej = ejById(ejId); if (!ej) return '';
   const obj = ej.objetivo_id && objById(ej.objetivo_id);
-  const sets = seriesDe(ent.id, ejId);
+  const b = ent.ejercicios.slice(0, idx).filter((x) => x === ejId).length;   // tanda: 0 la primera vez que sale en el entreno
+  const sets = seriesDe(ent.id, ejId, b);
   const prev = sesionPrevia(state, ejId, ui.fecha);
   const esT = ej.tipo === 'tiempo', esC = ej.tipo === 'complejo';
   const asist = cargaDe(ej).asist;
+  const tandaTxt = b > 0 ? ` · tanda ${b + 1}` : '';
+
+  // Plegada: una línea con el nombre y lo que hiciste. Concluido: igual, sin botones.
+  const concl = !!ent.concluido;
+  if (concl || ui.plegados?.has(clavePleg(ejId, b))) {
+    const hechas = sets.filter(serieHecha);
+    const pend = sets.length - hechas.length;
+    const rec = hechas.some(esRecord);
+    const txt = hechas.length ? hechas.map((s) => fmtSerie(s, ej.tipo)).join(' · ') : 'Sin series hechas';
+    const cuerpo = `<span class="min-w-0 flex-1"><span class="block font-bold leading-tight truncate">${rec ? '<span class="text-accent">★</span> ' : ''}${esc(ej.nombre)}<span class="text-sm font-semibold text-mute">${esc(tandaTxt)}</span></span>
+      <span class="block text-sm text-mute truncate">${esc(txt)}${!concl && pend ? ` · ${pend} sin hacer` : ''}</span></span>`;
+    return concl
+      ? `<section class="card card-c" data-ej="${ej.id}" data-b="${b}">${cuerpo}</section>`
+      : `<section class="card card-c" data-ej="${ej.id}" data-b="${b}"><button class="card-c-btn" data-action="abrir-ej" aria-expanded="false" aria-label="Editar ${esc(ej.nombre)}">${cuerpo}<span class="text-sm font-semibold text-accent shrink-0">Editar</span></button></section>`;
+  }
+
+  const ps = setsPrevios(prev, b);
   const prevTxt = prev
-    ? `Última vez · ${fechaCorta(prev.fecha)}: <b class="text-ink font-semibold">${prev.sets.map((s) => fmtSerie(s, ej.tipo)).join(' · ')}</b>`
+    ? `Última vez · ${fechaCorta(prev.fecha)}: <b class="text-ink font-semibold">${ps.map((s) => fmtSerie(s, ej.tipo)).join(' · ')}</b>`
     : 'Primera vez con este ejercicio';
 
   const filas = sets.map((s, i) => {
-    const p = marcaRef(ent.id, ejId, i);
+    const p = marcaRef(ent.id, ejId, i, b);
     const ok = serieHecha(s);
     return `<div class="set-row ${esC ? 'cx' : ''} ${ok ? 'done' : ''}" data-serie="${s.id}">
       <span class="set-n" data-n="${i + 1}" ${esRecord(s) ? 'title="Récord"' : ''}>${esRecord(s) ? '★' : i + 1}</span>
@@ -489,11 +569,11 @@ function cardEjercicio(ent, ejId) {
     </div>`;
   }).join('');
 
-  return `<section class="card" data-ej="${ej.id}">
+  return `<section class="card" data-ej="${ej.id}" data-b="${b}">
     <div class="flex items-start justify-between gap-2">
       <div class="min-w-0">
         <h2 class="text-lg font-bold leading-tight">${esc(ej.nombre)}</h2>
-        <div class="flex flex-wrap gap-1.5 mt-1">${obj ? chip(obj.nombre) : ''}${chip(tipoTxt(ej.tipo))}</div>
+        <div class="flex flex-wrap gap-1.5 mt-1">${b > 0 ? chip(`Tanda ${b + 1}`) : ''}${obj ? chip(obj.nombre) : ''}${chip(tipoTxt(ej.tipo))}</div>
       </div>
       <button class="icon-btn shrink-0" data-action="menu-ej" aria-label="Más opciones">${I.more}</button>
     </div>
@@ -502,7 +582,9 @@ function cardEjercicio(ent, ejId) {
       <span class="text-center">Nº</span><span class="text-center">${esT ? 'Segundos' : 'Reps'}</span>${esC ? '<span class="text-center">Seg</span>' : ''}<span class="text-center">${asist ? 'Banda' : '+ Kg'}</span><span class="text-center">✓</span><span></span>
     </div>
     <div class="space-y-2">${filas}</div>
-    <button class="btn-ghost w-full mt-3" data-action="add-serie">＋ Añadir serie</button>
+    <div class="grid grid-cols-2 gap-2 mt-3">
+      <button class="btn-ghost" data-action="add-serie">＋ Añadir serie</button>
+      <button class="btn-ghost !bg-accent/15 !text-accent" data-action="listo-ej">Listo ✓</button></div>
   </section>`;
 }
 
@@ -579,21 +661,24 @@ function pickerItems(q = '') {
   if (!lista.length) return state.ejercicios.length ? '<p class="text-mute text-center py-6">Ningún ejercicio coincide.</p>'
       : '<div class="text-center py-6"><p class="text-mute mb-3">Aún no tienes ejercicios.</p><button class="btn-ghost w-full" data-action="biblioteca">Abrir biblioteca de ejercicios</button></div>';
   return lista.map((e) => {
-    const dentro = ent && ent.ejercicios.includes(e.id);
+    const n = ent ? veces(ent, e.id) : 0;   // ya está en el entreno: se puede añadir otra vez (otra tanda)
     const obj = e.objetivo_id && objById(e.objetivo_id);
-    return `<button class="pick-row" data-action="pick-ej" data-id="${e.id}" ${dentro ? 'disabled' : ''}>
+    return `<button class="pick-row" data-action="pick-ej" data-id="${e.id}">
       <span class="min-w-0 text-left"><span class="block font-semibold truncate">${esc(e.nombre)}</span>
       <span class="block text-xs text-mute">${obj ? esc(obj.nombre) + ' · ' : ''}${tipoTxt(e.tipo)}</span></span>
-      <span class="text-sm ${dentro ? 'text-accent' : 'text-mute'}">${dentro ? '✓ Añadido' : 'Añadir'}</span></button>`;
+      <span class="text-sm shrink-0 ${n ? 'text-accent' : 'text-mute'}">${n ? `✓${n > 1 ? ' ×' + n : ''} · otra vez` : 'Añadir'}</span></button>`;
   }).join('');
 }
 
 function sheetPicker() {
+  // Cabecera y buscador fijos arriba; solo la lista se desplaza: con el teclado abierto no quedan tapados.
   abrirSheet(`
-    <div class="flex items-center justify-between mb-3"><h2 class="text-xl font-bold">Añadir ejercicio</h2>
-      <button class="btn-mini" data-action="nuevo-ej-entreno">＋ Nuevo</button></div>
-    <input data-field="buscar" type="search" class="inp inp-text mb-3" placeholder="Buscar…" autocomplete="off">
-    <div id="picker-list" class="space-y-1.5">${pickerItems()}</div>`);
+    <div class="picker-head">
+      <div class="flex items-center justify-between mb-3"><h2 class="text-xl font-bold">Añadir ejercicio</h2>
+        <button class="btn-mini" data-action="nuevo-ej-entreno">＋ Nuevo</button></div>
+      <input data-field="buscar" type="search" enterkeyhint="search" class="inp inp-text mb-3" placeholder="Buscar…" autocomplete="off">
+    </div>
+    <div id="picker-list" class="space-y-1.5">${pickerItems()}</div>`, { clase: 'sheet-picker' });
 }
 
 function sheetEjercicio(ejId = null, { anadir = false } = {}) {
@@ -967,7 +1052,7 @@ function calendarioYLista(selFecha) {
 
   const lista = entrenosDelMes(h.y, h.m);
   const items = lista.length ? lista.map((ent) => {
-    const nombres = ent.ejercicios.map((id) => ejById(id)?.nombre).filter(Boolean);
+    const nombres = [...new Set(ent.ejercicios)].map((id) => ejById(id)?.nombre).filter(Boolean);
     const sets = state.series.filter((s) => s.entrenamiento_id === ent.id && serieHecha(s)).length;
     return `<button class="card w-full text-left flex items-center justify-between gap-3 !p-3.5 ${ent.fecha === selFecha ? 'row-sel' : ''}" data-action="hist-dia" data-fecha="${ent.fecha}">
       <span class="min-w-0"><span class="block font-semibold first-letter:uppercase">${esc(fechaLarga(ent.fecha))}</span>
@@ -1009,8 +1094,9 @@ function vistaDia(fecha, pc = false) {
       `<div class="card text-center py-10"><p class="text-mute mb-4">No hay entreno registrado este día.</p>
       <button class="btn-primary w-full" data-action="hist-editar" data-fecha="${fecha}">Registrar entreno</button></div>`;
   }
-  const bloques = ent.ejercicios.map((ejId) => {
+  const bloques = [...new Set(ent.ejercicios)].map((ejId) => {
     const ej = ejById(ejId); if (!ej) return '';
+    const nT = veces(ent, ejId);
     const obj = ej.objetivo_id && objById(ej.objetivo_id);
     const act = sesionesDeEjercicio(state, ejId).find((s) => s.entrenamiento_id === ent.id);
     const prev = sesionPrevia(state, ejId, ent.fecha);
@@ -1024,9 +1110,9 @@ function vistaDia(fecha, pc = false) {
       cmp = `<p class="text-sm leading-relaxed">${partes.join(' &nbsp;·&nbsp; ')}</p>
         <p class="text-xs text-mute mt-1">vs ${esc(fechaCorta(prev.fecha))}: ${prev.sets.map((s) => fmtSerie(s, ej.tipo)).join(' · ')}</p>`;
     }
-    const sets = act ? act.sets.map((s) => `<span class="set-pill">${fmtV(s.valor, ej.tipo)}${ej.tipo === 'complejo' && s.segundos ? `<small>×${num(s.segundos, 0)}s</small>` : ''}${s.peso_extra ? `<small> +${num(s.peso_extra)}kg</small>` : ''}</span>`).join('') : '';
+    const sets = act ? act.sets.map((s, i) => `${i > 0 && tandaDe(s) !== tandaDe(act.sets[i - 1]) ? '<span class="basis-full h-0" aria-hidden="true"></span>' : ''}<span class="set-pill">${fmtV(s.valor, ej.tipo)}${ej.tipo === 'complejo' && s.segundos ? `<small>×${num(s.segundos, 0)}s</small>` : ''}${s.peso_extra ? `<small> +${num(s.peso_extra)}kg</small>` : ''}</span>`).join('') : '';
     return `<section class="card"><div class="flex items-start justify-between gap-2 mb-2">
-        <h3 class="font-bold text-lg leading-tight">${esc(ej.nombre)}</h3>${obj ? chip(obj.nombre) : ''}</div>
+        <h3 class="font-bold text-lg leading-tight">${esc(ej.nombre)}</h3><span class="flex flex-wrap justify-end gap-1.5">${nT > 1 ? chip(`${nT} tandas`) : ''}${obj ? chip(obj.nombre) : ''}</span></div>
       <div class="flex flex-wrap gap-1.5 mb-3">${sets}</div>${cmp}</section>`;
   }).join('');
 
@@ -1334,7 +1420,7 @@ const acciones = {
   // Entrenar
   dia: (el) => { ui.fecha = addDays(ui.fecha, +el.dataset.d); render({ top: true }); },
   'dia-hoy': () => { ui.fecha = hoy(); render({ top: true }); },
-  picker: () => sheetPicker(),
+  picker: () => { if (entDe(ui.fecha)?.concluido) { toast('Entreno concluido: pulsa “Editar entreno” para añadir más'); return; } sheetPicker(); },
   'nuevo-ej-entreno': () => sheetEjercicio(null, { anadir: true }),
   'cat-ver': (el) => { ui.cat.ver = el.dataset.v; render(); },
   'cat-zona': (el) => { ui.cat.zona = el.dataset.v; render(); },
@@ -1349,14 +1435,51 @@ const acciones = {
     for (const it of items) await crearDeBiblioteca(it);
     render(); toast(`${items.length} ejercicios básicos añadidos`);
   },
-  'cat-hoy': async (el) => { await addEjAlEntreno(el.dataset.id); render(); toast(`Añadido al entreno de ${ui.fecha === hoy() ? 'hoy' : fechaCorta(ui.fecha)}`); },
-  'pick-ej': async (el) => { await addEjAlEntreno(el.dataset.id); cerrarSheet(); render(); },
+  'cat-hoy': async (el) => {
+    const e0 = entDe(ui.fecha);
+    if (e0 && veces(e0, el.dataset.id)) { toast('Ya está en ese entreno (para repetirlo, usa “Añadir ejercicio” en Entrenar)'); return; }
+    await addEjAlEntreno(el.dataset.id); render(); toast(`Añadido al entreno de ${ui.fecha === hoy() ? 'hoy' : fechaCorta(ui.fecha)}`); },
+  'pick-ej': async (el) => {
+    const b = await addEjAlEntreno(el.dataset.id);
+    cerrarSheet(); render();
+    if (b > 0) toast(`Añadido otra vez (tanda ${b + 1})`);
+    document.querySelector(`[data-ej="${el.dataset.id}"][data-b="${b}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  },
   'add-serie': async (el) => {
-    const ejId = el.closest('[data-ej]').dataset.ej;
-    await addSerie(ejId); render();
+    const card = el.closest('[data-ej]'); const ejId = card.dataset.ej; const b = +card.dataset.b || 0;
+    await addSerie(ejId, b); render();
     // la serie nueva debe verse siempre (no quedar tras el botón fijo ni la barra)
-    const filas = document.querySelectorAll(`[data-ej="${ejId}"] [data-serie]`);
+    const filas = document.querySelectorAll(`[data-ej="${ejId}"][data-b="${b}"] [data-serie]`);
     filas[filas.length - 1]?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  },
+  'listo-ej': (el) => {
+    const card = el.closest('[data-ej]');
+    if (ui.crono) pararCrono();
+    (ui.plegados ||= new Set()).add(clavePleg(card.dataset.ej, +card.dataset.b || 0));
+    render();
+  },
+  'abrir-ej': (el) => {
+    const card = el.closest('[data-ej]'); const ejId = card.dataset.ej; const b = +card.dataset.b || 0;
+    ui.plegados?.delete(clavePleg(ejId, b));
+    render();
+    document.querySelector(`[data-ej="${ejId}"][data-b="${b}"]`)?.scrollIntoView({ block: 'nearest' });
+  },
+  concluir: async () => {
+    const ent = entDe(ui.fecha); if (!ent) return;
+    if (!state.series.some((s) => s.entrenamiento_id === ent.id && serieHecha(s))) { toast('Marca alguna serie como hecha antes de concluir'); return; }
+    if (ui.crono) pararCrono();
+    flush();
+    ent.concluido = true;
+    await DB.put('entrenamientos', ent);
+    render({ top: true });
+    toast('Entreno concluido');
+  },
+  reabrir: async () => {
+    const ent = entDe(ui.fecha); if (!ent) return;
+    delete ent.concluido;               // quitar el campo (no ponerlo a false) para no cambiar el contenido de entrenos antiguos
+    ui.plegFecha = null;                // se recalcula qué tarjetas empiezan plegadas
+    await DB.put('entrenamientos', ent);
+    render();
   },
   'del-serie': async (el) => {
     if (ui.crono) pararCrono();
@@ -1372,8 +1495,8 @@ const acciones = {
       if (!(s.valor > 0)) {
         // Un toque = repetir la marca de la última vez en esa misma serie
         const ent = entDe(ui.fecha);
-        const idx = seriesDe(ent.id, s.ejercicio_id).findIndex((x) => x.id === s.id);
-        const p = marcaRef(ent.id, s.ejercicio_id, idx);
+        const idx = seriesDe(ent.id, s.ejercicio_id, tandaDe(s)).findIndex((x) => x.id === s.id);
+        const p = marcaRef(ent.id, s.ejercicio_id, idx, tandaDe(s));
         if (!p) { toast('Introduce primero las reps o los segundos'); row.querySelector('[data-field="valor"]').focus(); return; }
         s.valor = p.valor; row.querySelector('[data-field="valor"]').value = s.valor;
         if (s.peso_extra == null && p.peso_extra) { s.peso_extra = p.peso_extra; row.querySelector('[data-field="peso"]').value = s.peso_extra; }
@@ -1424,16 +1547,23 @@ const acciones = {
   },
   crono: (el) => toggleCrono(el.closest('[data-serie]').dataset.serie),
   'menu-ej': (el) => {
-    const ejId = el.closest('[data-ej]').dataset.ej;
-    abrirSheet(`<h2 class="text-xl font-bold mb-3">${esc(ejById(ejId).nombre)}</h2><div class="grid gap-2">
+    const card = el.closest('[data-ej]'); const ejId = card.dataset.ej; const b = +card.dataset.b || 0;
+    abrirSheet(`<h2 class="text-xl font-bold mb-3">${esc(ejById(ejId).nombre)}${b > 0 ? ` <span class="text-mute text-base font-semibold">· tanda ${b + 1}</span>` : ''}</h2><div class="grid gap-2">
+      <button class="btn-ghost" data-action="repetir-ej" data-id="${ejId}">Añadir otra tanda de este ejercicio</button>
       <button class="btn-ghost" data-action="editar-ej" data-id="${ejId}">Editar ejercicio</button>
-      <button class="btn-danger" data-action="quitar-ej" data-id="${ejId}">Quitar de este entreno</button>
+      <button class="btn-danger" data-action="quitar-ej" data-id="${ejId}" data-b="${b}">${b > 0 || veces(entDe(ui.fecha), ejId) > 1 ? 'Quitar esta tanda del entreno' : 'Quitar de este entreno'}</button>
       <button class="btn-ghost" data-action="close-sheet">Cerrar</button></div>`);
   },
   'quitar-ej': async (el) => {
     if (ui.crono) pararCrono();
     cerrarSheet();
-    await conDeshacer('Ejercicio quitado del entreno', () => quitarEjDelEntreno(el.dataset.id)); render();
+    await conDeshacer('Ejercicio quitado del entreno', () => quitarEjDelEntreno(el.dataset.id, +el.dataset.b || 0)); render();
+  },
+  'repetir-ej': async (el) => {
+    cerrarSheet();
+    const b = await addEjAlEntreno(el.dataset.id); render();
+    toast(`Añadida la tanda ${b + 1}`);
+    document.querySelector(`[data-ej="${el.dataset.id}"][data-b="${b}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
   },
 
   // Formularios
@@ -1553,9 +1683,9 @@ async function avanzarCampo(el) {
   if (sigCampo) { sigCampo.focus(); return; }
   const sig = row.nextElementSibling;
   if (sig && sig.matches('[data-serie]')) { sig.querySelector('[data-field="valor"]')?.focus(); return; }
-  const ejId = row.closest('[data-ej]').dataset.ej;
-  await addSerie(ejId); render();
-  const filas = document.querySelectorAll(`[data-ej="${ejId}"] [data-serie]`);
+  const card = row.closest('[data-ej]'); const ejId = card.dataset.ej; const b = +card.dataset.b || 0;
+  await addSerie(ejId, b); render();
+  const filas = document.querySelectorAll(`[data-ej="${ejId}"][data-b="${b}"] [data-serie]`);
   filas[filas.length - 1]?.querySelector('[data-field="valor"]')?.focus();
 }
 
@@ -1598,7 +1728,7 @@ function atajosGlobales(e) {
   const k = e.key;
   if (k === '1' || k === '2' || k === '3' || k === '4') irA(['train', 'history', 'stats', 'library'][+k - 1]);
   else if (k === '?') sheetAtajos();
-  else if ((k === 'n' || k === 'N') && ui.view === 'train') { e.preventDefault(); sheetPicker(); }
+  else if ((k === 'n' || k === 'N') && ui.view === 'train') { e.preventDefault(); if (entDe(ui.fecha)?.concluido) toast('Entreno concluido: pulsa “Editar entreno” para añadir más'); else sheetPicker(); }
   else if (ui.view === 'train' && (k === 'ArrowLeft' || k === 'ArrowRight')) acciones.dia({ dataset: { d: k === 'ArrowLeft' ? -1 : 1 } });
   else if (esPC() && (k === 'ArrowUp' || k === 'ArrowDown')) { if (ui.view !== 'train') { e.preventDefault(); moverSeleccion(k === 'ArrowDown' ? 1 : -1); } }
 }

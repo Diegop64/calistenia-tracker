@@ -126,11 +126,23 @@
   .sheet-backdrop { @apply fixed inset-0 z-40 bg-black/65; animation: fade .18s ease-out; }
   .sheet {
     @apply fixed inset-x-0 bottom-0 z-50 mx-auto overflow-y-auto rounded-t-3xl border-t border-line bg-card px-4 pt-2;
-    max-width: var(--shell-max); max-height: 88dvh;
+    max-width: var(--shell-max);
+    max-height: min(88dvh, calc(var(--vvh, 100dvh) - 12px));   /* con teclado: solo el alto visible */
+    bottom: var(--kb, 0px);                                     /* y la hoja sube por encima del teclado */
     padding-bottom: calc(env(safe-area-inset-bottom) + 18px);
     animation: up .22s cubic-bezier(.2, .8, .2, 1);
   }
   .sheet-grip { @apply mx-auto mb-3 h-1 w-10 rounded-full bg-line; }
+  body.kb-open .sheet { padding-bottom: 10px; }
+  /* Selector de ejercicios: cabecera y buscador fijos, solo la lista se desplaza */
+  .sheet-picker { display: flex; flex-direction: column; overflow: hidden; }
+  .sheet-picker .picker-head { flex: none; }
+  .sheet-picker #picker-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+  /* Tarjeta de ejercicio plegada / concluida */
+  .card-c { padding: 0; }
+  .card-c:not(:has(.card-c-btn)) { display: flex; align-items: center; gap: .75rem; padding: .8rem 1rem; }
+  .card-c-btn { display: flex; width: 100%; align-items: center; gap: .75rem; padding: .8rem 1rem; text-align: left; border-radius: inherit; }
+  .card-c-btn:active { background: rgb(255 255 255 / .04); }
   @keyframes up { from { transform: translateY(40px); opacity: 0; } }
   @keyframes fade { from { opacity: 0; } }
 
@@ -152,7 +164,7 @@
   /* Entrenar: en móvil una columna (avisos → resumen → ejercicios → notas); en PC rejilla con panel lateral */
   .train-grid { display: flex; flex-direction: column; }
   .train-side { display: contents; }
-  .train-avisos { order: 0; } .train-resumen { order: 1; } .train-main { order: 2; } .train-notas { order: 3; }
+  .train-avisos { order: 0; } .train-resumen { order: 1; } .train-main { order: 2; } .train-notas { order: 3; } .train-concluir { order: 4; }
   .train-cards { display: grid; gap: .75rem; }
   .nav-brand, .nav-foot, .nav-kbd, .pc-only { display: none; }
 

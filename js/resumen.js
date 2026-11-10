@@ -16,7 +16,7 @@ export const INSTRUCCIONES_IA = `Actúa como un entrenador de calistenia con exp
 4. Ajustes concretos para las próximas 2-4 semanas: ejercicios, series, repeticiones o segundos, descansos y progresión.
 5. Qué otros datos debería anotar para que el próximo análisis sea mejor.
 
-Cómo leer los datos: «+5kg» es lastre; «−10kg banda» es asistencia de una banda (menos asistencia = progreso); en ejercicios marcados «carga: solo kg» (press, curl, sentadilla con barra) los kg son la carga total. «Fuerza estimada» = carga × (1 + reps/30) contando mi peso corporal: si sube el lastre y bajan las reps, mira la fuerza, no las reps. Las tendencias son automáticas y con pocas sesiones pueden ser ruido.
+Cómo leer los datos: si un ejercicio aparece con varios grupos separados por « | », son tandas distintas el mismo día (p. ej. con lastre y luego sin él); «+5kg» es lastre; «−10kg banda» es asistencia de una banda (menos asistencia = progreso); en ejercicios marcados «carga: solo kg» (press, curl, sentadilla con barra) los kg son la carga total. «Fuerza estimada» = carga × (1 + reps/30) contando mi peso corporal: si sube el lastre y bajan las reps, mira la fuerza, no las reps. Las tendencias son automáticas y con pocas sesiones pueden ser ruido.
 
 Si necesitas contexto (edad, experiencia, objetivos, material), pregúntame antes de proponer cambios. No des consejo médico: si hay dolor persistente, recomiéndame consultar a un profesional.`;
 
@@ -103,12 +103,16 @@ export function generarResumen(state, { desde = null, hasta = null, instruccione
     if (ent.peso_corporal) meta.push(`Peso corporal: ${num(ent.peso_corporal)} kg`);
     if (meta.length) out.push(meta.join(' · '));
     if ((ent.notas || '').trim()) out.push(`Notas: ${ent.notas.trim().replace(/\s*\n\s*/g, ' / ')}`);
-    for (const ejId of ent.ejercicios || []) {
+    for (const ejId of new Set(ent.ejercicios || [])) {
       const ej = ejById.get(ejId); if (!ej) continue;
       const sets = state.series.filter((s) => s.entrenamiento_id === ent.id && s.ejercicio_id === ejId && serieHecha(s))
-        .sort((a, b) => a.set_numero - b.set_numero);
+        .sort((a, b) => (a.bloque || 0) - (b.bloque || 0) || a.set_numero - b.set_numero);
       const obj = ej.objetivo_id && objById.get(ej.objetivo_id);
-      out.push(`- ${ej.nombre}${obj ? ` [${obj.nombre}]` : ''}: ${sets.length ? sets.map((s) => textoSerie(s, ej.tipo, cargaDe(ej).asist)).join(', ') : '(sin series completadas)'}`);
+      // si el ejercicio se repitió en el mismo día, cada tanda va separada por « | »
+      const tandas = [];
+      for (const s of sets) { const t = s.bloque || 0; (tandas[t] ||= []).push(textoSerie(s, ej.tipo, cargaDe(ej).asist)); }
+      const txt = tandas.filter(Boolean).map((g) => g.join(', ')).join(' | ');
+      out.push(`- ${ej.nombre}${obj ? ` [${obj.nombre}]` : ''}: ${txt || '(sin series completadas)'}`);
     }
     out.push('');
   }

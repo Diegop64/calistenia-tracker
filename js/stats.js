@@ -60,7 +60,7 @@ export function sesionesDeEjercicio(state, ejercicioId) {
     porEnt.get(ent.id).sets.push(s);
   }
   const out = [...porEnt.values()].map((ses) => {
-    ses.sets.sort((a, b) => a.set_numero - b.set_numero);
+    ses.sets.sort((a, b) => (a.bloque || 0) - (b.bloque || 0) || a.set_numero - b.set_numero);   // tandas repetidas en orden
     ses.max = Math.max(...ses.sets.map((s) => s.valor));
     ses.volumen = ses.sets.reduce((t, s) => t + s.valor, 0);
     const kgs = ses.sets.map((s) => s.peso_extra || 0);

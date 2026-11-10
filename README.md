@@ -207,3 +207,12 @@ El código está en `js/resumen.js` (función pura `generarResumen`).
 - **Peso corporal**: se anota en «Cómo ha ido» (cada 1-2 semanas basta). Con él, la **fuerza estimada** = carga × (1 + reps/30) mide el progreso cuando hay lastre, banda o kg externos, así que subir lastre y bajar reps no cuenta como bajada.
 - **Tendencia**: mejor marca de las últimas 3 sesiones frente a las 3 anteriores; con menos de 4 sesiones no opina. El índice de objetivo usa media geométrica y solo ejercicios entrenados en las últimas 6 semanas.
 - **Registro**: al añadir un ejercicio se crean tantas series como la última vez (reps vacías con la marca anterior en gris; ✓ la repite); ★ marca un récord; el crono no sobrescribe series hechas y descarta toques de menos de 3 s; al volver a la app tras unas horas se abre en hoy.
+
+## Entreno en el móvil: tandas, plegado y concluir (v15)
+
+- **Repetir un ejercicio en la misma sesión** (p. ej. dominadas lastradas → otro ejercicio → dominadas normales): en el selector, un ejercicio que ya está en el entreno muestra «✓ · otra vez»; también en el menú ⋯ de la tarjeta («Añadir otra tanda»). Cada aparición es una *tanda*.
+  Datos: `entrenamientos.ejercicios` puede contener el mismo id más de una vez; la n-ésima aparición es la tanda n-1. Las series de la tanda 0 **no** llevan campo (por eso lo guardado antes sigue siendo válido tal cual); las demás llevan `bloque: n`. Las estadísticas, el historial y el «Resumen para IA» agrupan por ejercicio (en el resumen, las tandas se separan con « | »).
+- **Tarjetas plegables**: «Listo ✓» pliega un ejercicio a una línea (nombre + lo que hiciste); «Editar» lo abre. Al abrir un día, los ejercicios con todas las series hechas empiezan plegados; el que añades, abierto. Es solo de la vista: no se guarda nada.
+- **Concluir entreno** / **Editar entreno**: al concluir (`entrenamientos.concluido: true`) desaparecen series editables, botones y el «＋ Añadir ejercicio», y queda un resumen compacto. «Editar entreno» lo reabre (borra el campo).
+- **Teclado en el selector (móvil)**: la hoja sube por encima del teclado (`visualViewport`), el buscador queda fijo arriba y solo se desplaza la lista.
+- Compatibilidad: todos los campos nuevos (`bloque`, `concluido`) son opcionales; los entrenos anteriores se abren igual que antes.
