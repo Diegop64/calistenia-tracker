@@ -1,8 +1,11 @@
 // Motor de sincronización — lógica pura (sin Firebase ni IndexedDB), por eso se puede probar en Node.
 //
-// Modelo en la nube (Firestore, bajo users/{uid}/data/...):
-//   catalogo        → { objetivos: [...], ejercicios: [...] }
-//   mes-YYYY-MM     → { entrenamientos: [...], series: [...] }   (todo un mes en un documento)
+// Modelo en la nube (Firestore):
+//   comun/catalogo                → { ejercicios: [...] }   COMÚN a todos los usuarios: definición de cada ejercicio
+//                                   (nombre, tipo, zona, carga…) SIN objetivo_id. En el motor es la clave 'comun'.
+//   users/{uid}/data/catalogo     → { objetivos: [...], ejercicios: [...] }   de cada usuario: sus objetivos y su copia de
+//                                   los ejercicios con SU objetivo_id (mismo formato que antes de existir 'comun').
+//   users/{uid}/data/mes-YYYY-MM  → { entrenamientos: [...], series: [...] }   (todo un mes en un documento)
 //
 // Cada documento se compara por "firma" (hash del contenido canónico) contra la `base`: la firma que tenía
 // la última vez que se sincronizó. Así sabemos quién cambió desde entonces:
@@ -10,7 +13,16 @@
 // Los borrados se propagan con una "lápida" ({_borrado:true}). En cambio, que un documento FALTE en la nube
 // (p. ej. borrado a mano desde la consola) NUNCA borra datos locales: se vuelve a subir.
 
+import { BIBLIOTECA } from './biblioteca.js';
+
 const porId = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+
+/** Clave del documento común (en Firestore: comun/catalogo). */
+export const COMUN = 'comun';
+/** Definición común de un ejercicio: todo menos lo que es de cada usuario (a qué objetivo lo asigna). */
+export const definicion = (e) => { const { objetivo_id: _o, ...d } = e; return d; };
+// ejercicio de la biblioteca → clave de su habilidad (para asignarlo a tu objetivo si te llega de otro usuario)
+const HABILIDAD_DE = new Map(BIBLIOTECA.filter((g) => g.habilidad).flatMap((g) => g.ejercicios.map(([k]) => [k, g.clave])));
 
 /** JSON canónico: claves ordenadas, sin undefined (para que la misma información dé siempre la misma firma). */
 export function canon(v) {
@@ -37,12 +49,13 @@ export function firma(obj) {
 
 const limpiar = (o) => JSON.parse(JSON.stringify(o));
 
-/** Estado local → documentos de la nube. */
-export function construirDocs(estado) {
+/** Estado local → documentos de la nube. Con `comun: false` (la nube no deja usar el catálogo común) no se genera. */
+export function construirDocs(estado, { comun = true } = {}) {
   const docs = {};
   if (estado.objetivos.length || estado.ejercicios.length) {
     docs.catalogo = { objetivos: [...estado.objetivos].sort(porId), ejercicios: [...estado.ejercicios].sort(porId) };
   }
+  if (comun && estado.ejercicios.length) docs[COMUN] = { ejercicios: estado.ejercicios.map(definicion) };
   const mesDeEnt = new Map();
   for (const e of estado.entrenamientos) {
     const k = 'mes-' + e.fecha.slice(0, 7);
@@ -57,12 +70,36 @@ export function construirDocs(estado) {
   return limpiar(docs);
 }
 
-/** Documentos → estado local completo. */
+/**
+ * Documentos → estado local completo.
+ * Con catálogo común: los ejercicios son los del común (su definición manda) y cada uno lleva el objetivo_id de TU copia.
+ * Un ejercicio que otro usuario quitó del común pero que tú tienes registrado se conserva (y volverá al común):
+ * así nadie pierde series porque otro borre un ejercicio.
+ */
 export function docsAEstado(docs) {
   const est = { objetivos: [], ejercicios: [], entrenamientos: [], series: [] };
   for (const [k, d] of Object.entries(docs)) {
     if (k === 'catalogo') { est.objetivos.push(...(d.objetivos || [])); est.ejercicios.push(...(d.ejercicios || [])); }
     else if (k.startsWith('mes-')) { est.entrenamientos.push(...(d.entrenamientos || [])); est.series.push(...(d.series || [])); }
+  }
+  const comun = docs[COMUN];
+  if (comun && Array.isArray(comun.ejercicios)) {
+    const propios = new Map(est.ejercicios.map((e) => [e.id, e]));
+    const usados = new Set(est.series.map((s) => s.ejercicio_id));
+    const out = [];
+    for (const d of comun.ejercicios) {
+      if (!d || !d.id) continue;
+      const p = propios.get(d.id);
+      let objetivo_id = p ? (p.objetivo_id ?? null) : null;
+      if (!p && d.clave && HABILIDAD_DE.has(d.clave)) {   // llega de otro usuario: si es de una habilidad que tienes como objetivo, se asigna
+        const o = est.objetivos.find((x) => x.clave === HABILIDAD_DE.get(d.clave));
+        if (o) objetivo_id = o.id;
+      }
+      out.push({ ...definicion(d), objetivo_id });
+      propios.delete(d.id);
+    }
+    for (const p of propios.values()) if (usados.has(p.id)) out.push(p);
+    est.ejercicios = out.sort(porId);
   }
   return est;
 }
@@ -129,8 +166,8 @@ export function planificar(locales, remotos, base) {
 export async function ejecutarSync({ leerLocal, remoto, leerBase, guardarBase, aplicarLocal, escrituras, ahora = Date.now }) {
   for (let intento = 0; intento < 3; intento++) {
     const n0 = escrituras();
-    const locales = construirDocs(leerLocal());
     const remotos = await remoto.listar();
+    const locales = construirDocs(leerLocal(), { comun: remoto.conComun ? remoto.conComun() : true });
     const base = (await leerBase()) || {};
     const plan = planificar(locales, remotos, base);
 
@@ -138,6 +175,8 @@ export async function ejecutarSync({ leerLocal, remoto, leerBase, guardarBase, a
       if (escrituras() !== n0) continue;              // el usuario cambió algo mientras esperábamos: reintentar
       await aplicarLocal(docsAEstado(plan.finales));
     }
+    // El catálogo común nunca se borra entero desde un dispositivo (p. ej. alguien que vacía su cuenta).
+    plan.borrarRemoto = plan.borrarRemoto.filter((k) => k !== COMUN);
     const nSubir = Object.keys(plan.subir).length;
     if (nSubir || plan.borrarRemoto.length) await remoto.escribir({ subir: plan.subir, borrar: plan.borrarRemoto, ahora: ahora() });
     await guardarBase(plan.base);

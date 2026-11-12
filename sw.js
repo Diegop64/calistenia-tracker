@@ -3,7 +3,7 @@
  * IMPORTANTE: al cambiar CUALQUIER archivo de la lista, sube VERSION (v1 -> v2...)
  * para que los móviles descarguen la versión nueva. Los datos (IndexedDB) NO se tocan.
  */
-const VERSION = 'v15';
+const VERSION = 'v16';
 const CACHE = `calistenia-${VERSION}`;
 
 const SHELL = [

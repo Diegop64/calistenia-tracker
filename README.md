@@ -101,15 +101,21 @@ IndexedDB sigue siendo la fuente de verdad en el iPhone; Firebase guarda una cop
 2. **Authentication → Usuarios → Agregar usuario** (tu email y contraseña; usa una contraseña larga y única). Copia el **UID** de ese usuario (columna "UID de usuario"): lo usarás en las reglas.
    - **Desactiva el registro de nuevos usuarios**: Authentication → Configuración → Acciones del usuario → desmarca *Habilitar la creación (registro)*. La app no ofrece registro, pero sin este ajuste cualquiera con la apiKey podría crear cuentas llamando a la API directamente.
 3. **Firestore Database → Crear base de datos** (modo producción; elige región europea).
-4. **Firestore → Reglas** → pega esto, **sustituye `TU_UID`** por el UID del paso 2 y pulsa *Publicar*. Solo tu usuario puede leer o escribir; cualquier otro, aunque estuviera registrado, recibe "permiso denegado":
+4. **Firestore → Reglas** → pega esto, **sustituye `TU_UID` y `UID_DE_TU_AMIGO`** por los UID de las cuentas (Authentication → Usuarios) y pulsa *Publicar*. Cada usuario solo puede leer o escribir lo suyo (`users/{su uid}`); el catálogo común de ejercicios (`comun`) lo comparten las cuentas de la lista; cualquier otro recibe "permiso denegado". Para añadir otra persona: crea su usuario y añade su UID a la lista `permitidos()`.
    ```
    rules_version = '2';
    service cloud.firestore {
      match /databases/{database}/documents {
+       function permitidos() { return ['TU_UID', 'UID_DE_TU_AMIGO']; }
+       function dentro() { return request.auth != null && request.auth.uid in permitidos(); }
+
+       // Lo de cada usuario: objetivos, entrenos, series, «Cómo ha ido»
        match /users/{uid}/{document=**} {
-         allow read, write: if request.auth != null
-                            && request.auth.uid == uid
-                            && uid == 'TU_UID';
+         allow read, write: if dentro() && request.auth.uid == uid;
+       }
+       // Lo común a todos: definición de los ejercicios
+       match /comun/{doc} {
+         allow read, write: if dentro();
        }
        match /{document=**} {
          allow read, write: if false;
@@ -117,6 +123,7 @@ IndexedDB sigue siendo la fuente de verdad en el iPhone; Firebase guarda una cop
      }
    }
    ```
+   Si aún tienes las reglas antiguas (sin `comun`), la app sigue sincronizando lo de cada usuario y avisa en Ajustes → Nube de que falta el catálogo común.
 5. **Authentication → Configuración → Dominios autorizados** → añade `TU_USUARIO.github.io` (localhost ya viene).
 6. **Restringe la apiKey** (opcional, recomendado): Google Cloud Console → APIs y servicios → Credenciales → tu *Browser key* → Restricciones de aplicación: *Sitios web* → añade `https://TU_USUARIO.github.io/*` y `http://localhost:8080/*`. Frena el uso casual desde otros sitios (no es una barrera total: la protección real son el login y las reglas).
 7. **Configuración del proyecto → Tus apps → app web → Config** → copia el objeto en `js/firebase-config.js` (sustituye `null`).
@@ -216,3 +223,18 @@ El código está en `js/resumen.js` (función pura `generarResumen`).
 - **Concluir entreno** / **Editar entreno**: al concluir (`entrenamientos.concluido: true`) desaparecen series editables, botones y el «＋ Añadir ejercicio», y queda un resumen compacto. «Editar entreno» lo reabre (borra el campo).
 - **Teclado en el selector (móvil)**: la hoja sube por encima del teclado (`visualViewport`), el buscador queda fijo arriba y solo se desplaza la lista.
 - Compatibilidad: todos los campos nuevos (`bloque`, `concluido`) son opcionales; los entrenos anteriores se abren igual que antes.
+
+
+## Varios usuarios en la misma app (v16)
+
+**Qué es común y qué es de cada uno**
+- **Común** (`comun/catalogo` en Firestore): la definición de los ejercicios (nombre, tipo, zona, carga). Si uno crea, renombra o ajusta un ejercicio, lo ven todos. La biblioteca de básicos también es común, porque va en el código.
+- **De cada usuario** (`users/{uid}/data`): objetivos, a qué objetivo asigna cada uno cada ejercicio, entrenos, series, «Cómo ha ido» y peso corporal. Nadie ve los entrenos ni los objetivos de otro.
+- Si alguien borra un ejercicio del catálogo común y otro usuario lo tiene registrado, ese usuario lo conserva y el ejercicio vuelve al común: nadie pierde series por un borrado ajeno.
+- Si dos usuarios añadieron por separado el mismo ejercicio de la biblioteca, la app los unifica (se queda el de id menor) y reasigna las series de cada uno.
+
+**En el dispositivo**: cada cuenta tiene su propia base de datos local (`calistenia-tracker--<uid>`), y sin sesión se usa otra aparte (`calistenia-tracker`). Al cambiar de cuenta la app cambia de base: nunca se mezclan ni se suben datos de una cuenta a otra. Al cerrar sesión, tus datos siguen guardados en el móvil y vuelven al iniciar sesión (también sin conexión).
+
+**Datos guardados antes de separar cuentas**: la primera vez que entra una cuenta, se queda con lo que había en el móvil solo si esa cuenta fue la última que lo sincronizó, o si nunca se había sincronizado con ninguna. Después, la base sin sesión queda vacía.
+
+**Limpiar una cuenta mezclada** (por el fallo anterior a v16, al cambiar de cuenta se subían los entrenos de una a la otra): entra con esa cuenta y usa **Ajustes → Eliminar todos los datos** («Borrar esta cuenta»). Borra los entrenos, series y objetivos de esa cuenta, en el móvil y en la nube. Los ejercicios comunes y las demás cuentas no se tocan. Si en tu propia cuenta aparecen días que no son tuyos, bórralos uno a uno en Historial.

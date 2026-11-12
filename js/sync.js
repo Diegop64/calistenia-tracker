@@ -3,7 +3,7 @@
 // El SDK de Firebase solo se carga si hay configuración (js/firebase-config.js).
 
 import * as DB from './db.js';
-import { ejecutarSync } from './syncCore.js';
+import { ejecutarSync, COMUN } from './syncCore.js';
 import { FIREBASE_CONFIG } from './firebase-config.js';
 
 export const configurado = !!FIREBASE_CONFIG;
@@ -13,6 +13,7 @@ const est = {
   usuario: null,                                  // { uid, email }
   ultima: null,                                   // timestamp de la última sync correcta
   error: null,
+  comunOk: true,                                  // false si las reglas de Firestore no dejan usar el catálogo común
 };
 
 let fb = null, auth = null, fs = null, ctx = null;
@@ -45,12 +46,14 @@ const limpiar = (o) => JSON.parse(JSON.stringify(o));
 
 /** Ejecuta el motor con el almacenamiento real de la app. (Se exporta también para poder probarlo con una nube simulada.) */
 function correr(remoto, uid) {
+  // Si mientras tanto se cambió de cuenta, se aborta: nunca se mezclan los datos de dos cuentas.
+  const vigente = () => { if (ctx.cuenta && ctx.cuenta() !== uid) throw Object.assign(new Error('Cambio de cuenta'), { code: 'cuenta-cambiada' }); };
   return ejecutarSync({
-    leerLocal: () => ctx.getState(),
-    remoto,
+    leerLocal: () => { vigente(); return ctx.getState(); },
+    remoto: { ...remoto, escribir: async (x) => { vigente(); return remoto.escribir(x); } },
     leerBase: async () => { const m = await DB.getMeta('syncBase'); return m && m.uid === uid ? m.firmas : {}; },
-    guardarBase: (firmas) => DB.setMeta('syncBase', { uid, firmas }),
-    aplicarLocal: (estado) => ctx.setState(estado),
+    guardarBase: (firmas) => { vigente(); return DB.setMeta('syncBase', { uid, firmas }); },
+    aplicarLocal: (estado) => { vigente(); return ctx.setState(estado); },
     escrituras: DB.escrituras,
   });
 }
@@ -65,24 +68,39 @@ async function sincronizar() {
     try {
       ctx.flush();
       const uid = est.usuario.uid;
-      const col = fb.collection(fs, 'users', uid, 'data');
+      const col = fb.collection(fs, 'users', uid, 'data');       // lo de cada usuario
+      const docComun = fb.doc(fs, 'comun', 'catalogo');           // los ejercicios, comunes a todos
+      const ref = (k) => (k === COMUN ? docComun : fb.doc(col, k));
+      let conComun = true;
       const remoto = {
+        conComun: () => conComun,
         async listar() {
           const snap = await fb.getDocs(col);
           const out = {};
           snap.forEach((d) => { const v = d.data(); out[d.id] = v._borrado ? { _borrado: true } : quitarMeta(v); });
+          try {
+            const c = await fb.getDoc(docComun);
+            if (c.exists()) out[COMUN] = quitarMeta(c.data());
+            conComun = true;
+          } catch (e) {
+            // Reglas de Firestore sin el catálogo común: se sigue sincronizando lo tuyo y se avisa en Ajustes.
+            if (!/permission-denied/.test((e && e.code) || '')) throw e;
+            conComun = false;
+          }
+          est.comunOk = conComun;
           return out;
         },
         async escribir({ subir, borrar, ahora }) {
           const b = fb.writeBatch(fs);               // atómico: catálogo y meses cambian juntos o no cambian
-          for (const [k, d] of Object.entries(subir)) b.set(fb.doc(col, k), { ...limpiar(d), v: 1, updatedAt: ahora });
-          for (const k of borrar) b.set(fb.doc(col, k), { _borrado: true, v: 1, updatedAt: ahora });
+          for (const [k, d] of Object.entries(subir)) b.set(ref(k), { ...limpiar(d), v: 1, updatedAt: ahora });
+          for (const k of borrar) b.set(ref(k), { _borrado: true, v: 1, updatedAt: ahora });
           await b.commit();
         },
       };
       const r = await correr(remoto, uid);
       est.fase = 'ok'; est.ultima = Date.now(); est.resumen = r;
     } catch (e) {
+      if (e && e.code === 'cuenta-cambiada') return;   // se cambió de cuenta a mitad: no es un error
       console.warn('Sync', e);
       est.fase = (e && /unavailable|network/.test(e.code || '')) ? 'offline' : 'error';
       est.error = mensajeError(e);
@@ -109,12 +127,27 @@ async function iniciar(contexto) {
   } catch (e) {
     est.fase = 'error'; est.error = 'No se pudo cargar el SDK de Firebase.'; notificar(); return;
   }
+  // Cada cambio de sesión se procesa en orden: se deja terminar la sync en curso, la app cambia a la base de esa
+  // cuenta (o a la de «sin sesión») y solo entonces se sincroniza. Así nunca se suben datos de una cuenta a otra.
+  let cola = Promise.resolve();
   fb.onAuthStateChanged(auth, (u) => {
-    est.usuario = u ? { uid: u.uid, email: u.email } : null;
-    est.fase = u ? 'listo' : 'sinsesion';
-    est.error = null;
-    notificar();
-    if (u) solicitar(300);
+    cola = cola.then(async () => {
+      clearTimeout(timer);
+      est.usuario = null;                      // mientras cambia, no arranca ninguna sync nueva
+      if (enCurso) { try { await enCurso; } catch { /* da igual */ } }
+      try {
+        if (ctx.cambiarCuenta) await ctx.cambiarCuenta(u ? u.uid : null);
+      } catch (e) {
+        console.warn('Cambio de cuenta', e);
+        est.fase = 'error'; est.error = 'No se pudieron abrir los datos de esta cuenta en el dispositivo.'; notificar();
+        return;
+      }
+      est.usuario = u ? { uid: u.uid, email: u.email } : null;
+      est.fase = u ? 'listo' : 'sinsesion';
+      est.error = null; est.ultima = null; est.comunOk = true;
+      notificar();
+      if (u) solicitar(300);
+    });
   });
   DB.onCambio(() => solicitar(5000));
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') solicitar(600); });

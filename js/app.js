@@ -61,7 +61,7 @@ function flush() {
   const by = {};
   for (const { store, obj } of pending.values()) (by[store] ||= []).push(obj);
   pending.clear();
-  for (const [s, arr] of Object.entries(by)) DB.putMany(s, arr).catch(avisarErrorGuardado);
+  return Promise.all(Object.entries(by).map(([s, arr]) => DB.putMany(s, arr).catch(avisarErrorGuardado)));
 }
 const flushSoon = debounce(flush, 250);
 const queue = (store, obj) => { pending.set(`${store}:${obj.id}`, { store, obj }); flushSoon(); };
@@ -240,6 +240,78 @@ async function normalizar() {
     if (typeof ent.notas !== 'string') { ent.notas = ''; if (!cambiados.includes(ent)) cambiados.push(ent); }
   }
   await DB.putMany('entrenamientos', cambiados);
+}
+
+/**
+ * El catálogo de ejercicios es común: si dos usuarios añadieron el mismo ejercicio de la biblioteca por separado,
+ * hay dos con la misma `clave`. Se queda el de id menor (todos los dispositivos eligen el mismo) y tus series y
+ * entrenos pasan a apuntar a él. Si un entreno tenía los dos, el segundo queda como otra tanda. Idempotente.
+ */
+async function fusionarDuplicadosBib() {
+  const porClave = new Map();
+  for (const e of state.ejercicios) if (e.clave) { if (!porClave.has(e.clave)) porClave.set(e.clave, []); porClave.get(e.clave).push(e); }
+  const cambSeries = new Set(), cambEnts = new Set(), cambEjs = new Set(), borrar = [];
+  for (const grupo of porClave.values()) {
+    if (grupo.length < 2) continue;
+    grupo.sort((a, b) => (a.id < b.id ? -1 : 1));
+    const keep = grupo[0];
+    for (const dup of grupo.slice(1)) {
+      if (keep.objetivo_id == null && dup.objetivo_id != null) { keep.objetivo_id = dup.objetivo_id; cambEjs.add(keep); }
+      for (const ent of state.entrenamientos) {
+        if (!ent.ejercicios.includes(dup.id)) continue;
+        // (id, tanda antigua) → tanda nueva, al sustituir el duplicado por el que se queda
+        const mapa = new Map(), cuenta = new Map(), nueva = [];
+        for (const id of ent.ejercicios) {
+          const tOld = cuenta.get(id) || 0; cuenta.set(id, tOld + 1);
+          const idN = id === dup.id ? keep.id : id;
+          if (idN === keep.id) mapa.set(`${id}:${tOld}`, nueva.filter((x) => x === keep.id).length);
+          nueva.push(idN);
+        }
+        for (const s of state.series) {
+          if (s.entrenamiento_id !== ent.id || (s.ejercicio_id !== dup.id && s.ejercicio_id !== keep.id)) continue;
+          const tOld = s.bloque || 0;
+          const t = mapa.get(`${s.ejercicio_id}:${tOld}`) ?? tOld;
+          if (s.ejercicio_id === keep.id && t === tOld) continue;
+          s.ejercicio_id = keep.id;
+          if (t > 0) s.bloque = t; else delete s.bloque;
+          cambSeries.add(s);
+        }
+        ent.ejercicios = nueva; cambEnts.add(ent);
+      }
+      for (const s of state.series) if (s.ejercicio_id === dup.id) { s.ejercicio_id = keep.id; cambSeries.add(s); }   // series sueltas
+      borrar.push(dup.id);
+    }
+  }
+  if (!borrar.length) return;
+  state.ejercicios = state.ejercicios.filter((e) => !borrar.includes(e.id));
+  await DB.putMany('series', [...cambSeries]);
+  await DB.putMany('entrenamientos', [...cambEnts]);
+  await DB.putMany('ejercicios', [...cambEjs]);
+  await DB.deleteWhere({ ejercicios: borrar });
+}
+
+/* ---------- Cuentas: cada usuario tiene sus propios datos en el dispositivo ---------- */
+let cuentaActual = null;   // uid de la cuenta cuyos datos se ven (null = sin sesión)
+async function cargarCuenta(uid) {
+  await DB.usarCuenta(uid);
+  cuentaActual = uid;
+  Object.assign(state, await DB.loadAll());
+  await normalizar();
+  await fusionarDuplicadosBib();
+  await retirarObjetivosGenericos();
+  ui.ultimaCopia = await DB.getMeta('ultimaCopia');
+}
+/** Lo llama la sincronización al iniciar o cerrar sesión (o al cambiar de cuenta). */
+async function cambiarCuenta(uid) {
+  uid = uid || null;
+  if (uid === cuentaActual) return;
+  if (ui.crono) pararCrono();
+  await flush();                       // lo pendiente de escribir va a la cuenta anterior
+  await cargarCuenta(uid);
+  lsSet('ct-uid', uid || '');
+  ui.undo = null; ui.plegFecha = null; ui.plegados = null;
+  ui.stats.ejId = ui.stats.objId = null; ui.stats.sel = null; ui.hist.sel = null;
+  render({ top: true });
 }
 
 /**
@@ -778,6 +850,7 @@ function htmlNube() {
   const color = e.fase === 'ok' ? 'text-accent' : e.fase === 'error' ? 'text-bad' : 'text-warn';
   return `<div class="flex justify-between gap-3 py-1.5"><span class="text-mute">Cuenta</span><span class="font-semibold truncate">${esc(e.usuario.email || '')}</span></div>
     <div class="flex justify-between gap-3 py-1.5"><span class="text-mute">Estado</span><span class="font-semibold text-right ${color}">${esc(estado)}</span></div>
+    ${e.comunOk === false ? '<p class="text-sm text-warn py-1.5">Tus datos se sincronizan, pero el catálogo común de ejercicios no: falta permitir <b>comun</b> en las reglas de Firestore (ver README).</p>' : ''}
     <div class="grid grid-cols-2 gap-2 mt-2">
       <button class="btn-ghost" data-action="nube-sync">Sincronizar ahora</button>
       <button class="btn-ghost" data-action="nube-logout">Cerrar sesión</button></div>`;
@@ -785,6 +858,11 @@ function htmlNube() {
 /** Texto y color del estado de la nube. */
 function nubeEstado() {
   const e = Sync.estado;
+  const quien = e.usuario ? (e.usuario.email || '').split('@')[0] + ' · ' : '';   // con varias cuentas, que se vea cuál está activa
+  const [t, c] = nubeEstadoBase(e);
+  return [t.replace('☁ ', '☁ ' + quien), c];
+}
+function nubeEstadoBase(e) {
   return !e.usuario ? ['☁ Sin sesión · iniciar', 'text-warn']
     : e.fase === 'ok' ? [`☁ Sincronizado ${haceTxt(e.ultima)}`, 'text-accent']
     : e.fase === 'sincronizando' ? ['☁ Sincronizando…', 'text-mute']
@@ -811,6 +889,7 @@ async function aplicarEstadoRemoto(nuevo) {
     Object.assign(state, nuevo);
     await normalizar();
   } finally { DB.silenciar(false); }
+  await fusionarDuplicadosBib();       // esto sí se sincroniza: todos los dispositivos acaban con el mismo
   await retirarObjetivosGenericos();   // por si llegan de otro dispositivo con una versión anterior (esto sí se sincroniza)
   ui.undo = null;
   if (!document.activeElement || !document.activeElement.matches('input,textarea,select')) render();
@@ -1534,7 +1613,7 @@ const acciones = {
   'ia-copiar': async () => { toast((await copiarTexto(ui.iaTxt)) ? 'Resumen copiado' : 'No se pudo copiar: selecciona el texto a mano'); },
   'ia-compartir': async () => { try { await navigator.share({ title: 'Mi registro de calistenia', text: ui.iaTxt }); } catch (e) { if (e && e.name !== 'AbortError') toast('No se pudo compartir'); } },
   'nube-sync': async () => { await Sync.ahora(); pintarNube(); },
-  'nube-logout': async () => { await Sync.logout(); pintarNube(); render(); toast('Sesión cerrada (tus datos siguen en este dispositivo)'); },
+  'nube-logout': async () => { await Sync.logout(); pintarNube(); render(); toast('Sesión cerrada. Tus datos siguen guardados y vuelven al iniciar sesión'); },
   'cerrar-nube': () => { lsSet('ct-nube-ok', '1'); render(); },
   biblioteca: () => sheetBiblioteca(),
   'bib-basicos': () => {
@@ -1575,7 +1654,8 @@ const acciones = {
     const dias = new Set(state.series.filter((s) => s.ejercicio_id === id).map((s) => s.entrenamiento_id)).size;
     const ok = await confirmar({
       titulo: `Eliminar «${ej.nombre}»`,
-      texto: n ? `⚠ Tiene ${n} series registradas en ${dias} entreno${dias === 1 ? '' : 's'}. Se borrarán también.` : 'No tiene registros.',
+      texto: (n ? `⚠ Tiene ${n} series tuyas registradas en ${dias} entreno${dias === 1 ? '' : 's'}. Se borrarán también.` : 'No tienes registros con él.')
+        + (Sync.estado.usuario ? ' Los ejercicios son comunes: desaparece también para los demás usuarios (salvo para quien lo tenga registrado, que lo conserva).' : ''),
       ok: 'Eliminar', peligro: true });
     if (ok) { if (ui.stats.ejId === id) ui.stats.ejId = null; await conDeshacer('Ejercicio eliminado', () => borrarEjercicio(id)); render(); }
   },
@@ -1618,10 +1698,17 @@ const acciones = {
   'actualizar-app': () => { (ui.updateSW || ui.reg?.waiting)?.postMessage('SKIP_WAITING'); },
   'cerrar-instala': () => { lsSet('ct-instala-ok', '1'); render(); },
   'borrar-todo': async () => {
-    const ok = await confirmar({ titulo: 'Eliminar todos los datos', texto: Sync.estado.usuario ? 'Se eliminarán entrenos, ejercicios y objetivos de este dispositivo Y TAMBIÉN de la nube (la sincronización propagará el borrado). Exporta una copia antes si no quieres perderlos.' : 'Se eliminarán entrenos, ejercicios y objetivos de este dispositivo. Exporta una copia antes si no quieres perderlos.', ok: 'Eliminar todo', peligro: true });
+    const u = Sync.estado.usuario;
+    const ok = await confirmar({ titulo: u ? 'Borrar los datos de esta cuenta' : 'Eliminar todos los datos',
+      texto: u ? `Se eliminarán los entrenos, series y objetivos de ${u.email || 'esta cuenta'}, en este dispositivo Y TAMBIÉN en la nube. Los ejercicios no se tocan: son comunes a todos los usuarios. Las demás cuentas no se ven afectadas. Exporta una copia antes si no quieres perderlos.`
+        : 'Se eliminarán entrenos, objetivos y ejercicios de este dispositivo. Exporta una copia antes si no quieres perderlos.',
+      ok: u ? 'Borrar esta cuenta' : 'Eliminar todo', peligro: true });
     if (!ok) return;
-    await DB.replaceAll({ objetivos: [], ejercicios: [], entrenamientos: [], series: [] });
-    Object.assign(state, { objetivos: [], ejercicios: [], entrenamientos: [], series: [] });
+    flush();
+    // Con sesión, los ejercicios (comunes) se conservan sin objetivo; sin sesión, se borra todo lo del dispositivo.
+    const ejercicios = u ? state.ejercicios.map((e) => ({ ...e, objetivo_id: null })) : [];
+    await DB.replaceAll({ objetivos: [], ejercicios, entrenamientos: [], series: [] });
+    Object.assign(state, { objetivos: [], ejercicios, entrenamientos: [], series: [] });
     ui.stats.ejId = ui.stats.objId = null; ui.hist.sel = null;
     render({ top: true }); toast('Datos eliminados');
   },
@@ -1830,17 +1917,15 @@ document.addEventListener('submit', async (e) => {
 async function init() {
   try {
     if (!('indexedDB' in window)) throw new Error('Este navegador no soporta IndexedDB.');
-    Object.assign(state, await DB.loadAll());
-    await normalizar();
-    await retirarObjetivosGenericos();
-    ui.ultimaCopia = await DB.getMeta('ultimaCopia');
+    // Se abre la cuenta de la última sesión para no enseñar otros datos mientras Firebase confirma quién eres.
+    await cargarCuenta(nubeConfigurada ? (lsGet('ct-uid') || null) : null);
   } catch (e) {
     viewEl.innerHTML = `<div class="note mt-10"><p class="font-semibold">No se pudo abrir el almacenamiento local</p>
       <p class="text-sm text-mute mt-1">${esc(e.message || e)}. Si usas navegación privada, ábrela en una pestaña normal.</p></div>`;
     return;
   }
   render();
-  Sync.iniciar({ getState: () => state, setState: aplicarEstadoRemoto, flush, onEstado: () => {
+  Sync.iniciar({ getState: () => state, setState: aplicarEstadoRemoto, flush, cambiarCuenta, cuenta: () => cuentaActual, onEstado: () => {
       pintarNube();
       const hay = !!Sync.estado.usuario, marca = hay + ':' + Sync.estado.fase;
       const cambio = hay !== ui.nubeUsuario || marca !== ui.nubeMarca;

@@ -7,8 +7,12 @@
 //   series          { id, entrenamiento_id, ejercicio_id, set_numero, valor, peso_extra, segundos? }   (segundos: solo 'complejo')
 //   meta            { key, value }   (última copia de seguridad, etc.)
 
-const DB_NAME = 'calistenia-tracker';
+// Una base por cuenta: 'calistenia-tracker--<uid>' con sesión iniciada; 'calistenia-tracker' sin sesión (o sin Firebase).
+// Antes de separar cuentas todo iba en 'calistenia-tracker': la primera vez que entra su dueño se le traslada (usarCuenta).
+const LEGADO = 'calistenia-tracker';
 const DB_VERSION = 1;
+let dbName = LEGADO;
+export const nombreBD = () => dbName;
 
 export const STORES = ['objetivos', 'ejercicios', 'entrenamientos', 'series'];
 
@@ -27,9 +31,13 @@ function cambio(store) {
 }
 
 function open() {
-  if (dbPromise) return dbPromise;
-  dbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
+  if (!dbPromise) dbPromise = abrir(dbName);
+  return dbPromise;
+}
+
+function abrir(nombre) {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(nombre, DB_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
       // Aquí irán las migraciones futuras: if (e.oldVersion < 2) {...}
@@ -56,7 +64,6 @@ function open() {
     req.onerror = () => reject(req.error);
     req.onblocked = () => reject(new Error('IndexedDB bloqueada por otra pestaña'));
   });
-  return dbPromise;
 }
 
 const wrap = (req) => new Promise((res, rej) => { req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error); });
@@ -109,6 +116,51 @@ export async function getMeta(key) {
 
 export async function setMeta(key, value) {
   return put('meta', { key, value });
+}
+
+/**
+ * Cambia a la base de una cuenta (uid) o a la de «sin sesión» (null). No mezcla nunca datos de dos cuentas.
+ * La primera vez que se abre la base de una cuenta, se queda con los datos guardados antes de separar cuentas
+ * solo si son suyos: los sincronizó por última vez esa misma cuenta, o no se sincronizaron nunca con ninguna.
+ * Devuelve { adoptado: true } si trasladó esos datos.
+ */
+export async function usarCuenta(uid) {
+  const nombre = uid ? `${LEGADO}--${uid}` : LEGADO;
+  if (nombre === dbName && dbPromise) return { adoptado: false };
+  if (dbPromise) { try { (await dbPromise).close(); } catch { /* ya cerrada */ } }
+  dbPromise = null; dbName = nombre;
+  if (!uid || (await getMeta('cuenta'))) return { adoptado: false };
+
+  const leg = await abrir(LEGADO);
+  try {
+    const get = (st) => wrap(leg.transaction(st).objectStore(st).getAll());
+    const datos = await Promise.all(STORES.map(get));
+    const metas = await get('meta');
+    const meta = Object.fromEntries(metas.map((m) => [m.key, m.value]));
+    const hay = datos.some((a) => a.length);
+    const suyos = hay && !meta.asignadaA && (meta.syncBase ? meta.syncBase.uid === uid : true);
+    if (suyos) {
+      const db = await open();
+      const tx = db.transaction([...STORES, 'meta'], 'readwrite');
+      STORES.forEach((st, i) => datos[i].forEach((v) => tx.objectStore(st).put(v)));
+      metas.filter((m) => m.key !== 'asignadaA').forEach((m) => tx.objectStore('meta').put(m));
+      tx.objectStore('meta').put({ key: 'cuenta', value: uid });
+      await done(tx);
+      // Copiados: la base «sin sesión» se vacía (quien use este móvil sin iniciar sesión no ve tus datos).
+      const tl = leg.transaction([...STORES, 'meta'], 'readwrite');
+      STORES.forEach((st) => tl.objectStore(st).clear());
+      tl.objectStore('meta').delete('syncBase');
+      tl.objectStore('meta').put({ key: 'asignadaA', value: uid });
+      await done(tl);
+      cambio('*');
+      return { adoptado: true };
+    }
+  } finally { leg.close(); }
+  const db = await open();
+  const tx = db.transaction('meta', 'readwrite');
+  tx.objectStore('meta').put({ key: 'cuenta', value: uid });
+  await done(tx);
+  return { adoptado: false };
 }
 
 /** Carga todo el dataset en memoria (es pequeño: miles de series caben de sobra). */
